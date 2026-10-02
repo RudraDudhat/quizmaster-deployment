@@ -1,0 +1,24 @@
+# ─── Secrets: never commit real env files ───
+.env
+.env.*
+!.env.example
+
+# ─── Docker / local runtime data ───
+postgres-data/
+kafka-data/
+volumes/
+docker-compose.override.yml
+
+# ─── IDE ───
+.idea/
+*.iml
+.vscode/
+
+# ─── OS noise ───
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Logs & archives ───
+*.log
+*.zip

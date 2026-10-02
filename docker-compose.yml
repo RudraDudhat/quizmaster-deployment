@@ -1,0 +1,231 @@
+name: quizmaster
+
+# ─────────────────────────────────────────────────────────────
+# Reusable snippets (YAML anchors)
+# ─────────────────────────────────────────────────────────────
+
+# Multi-stage build, from source, shared across every Spring Boot service.
+# The Maven cache is mounted so the 2nd..8th image reuse downloaded deps.
+x-app-build: &app-build
+  dockerfile_inline: |
+    # syntax=docker/dockerfile:1
+    FROM maven:3.9-eclipse-temurin-21 AS build
+    WORKDIR /app
+    COPY pom.xml .
+    COPY src ./src
+    RUN --mount=type=cache,target=/root/.m2 mvn -B -q clean package -DskipTests
+    FROM eclipse-temurin:21-jre
+    WORKDIR /app
+    COPY --from=build /app/target/*-SNAPSHOT.jar app.jar
+    EXPOSE 8080
+    ENTRYPOINT ["java","-jar","app.jar"]
+
+x-common-env: &common-env
+  EUREKA_URL: http://eureka-server:8761/eureka/
+  # Register by container IP so gateway/Feign load-balancing can reach instances.
+  EUREKA_INSTANCE_PREFERIPADDRESS: "true"
+  JAVA_TOOL_OPTIONS: ${JAVA_OPTS}
+
+x-db-env: &db-env
+  DB_USERNAME: ${POSTGRES_USER}
+  DB_PASSWORD: ${POSTGRES_PASSWORD}
+
+x-kafka-env: &kafka-env
+  KAFKA_BOOTSTRAP: kafka:9092
+  KAFKA_ENABLED: ${KAFKA_ENABLED}
+
+services:
+
+  # ─────────────── Infrastructure ───────────────
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+    ports:
+      # Host 5544 → the container's Postgres, kept OFF 5432 so it doesn't clash
+      # with a local PostgreSQL on 5432. Connect pgAdmin to localhost:5544 to see
+      # the app's data. (Services still reach it internally as postgres:5432.)
+      - "5544:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  kafka:
+    image: apache/kafka:3.8.1
+    # KRaft single-node — no Zookeeper. Internal only (advertised as kafka:9092).
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 15s
+
+  # ─────────────── Platform services ───────────────
+
+  eureka-server:
+    build:
+      <<: *app-build
+      context: ../quizmaster-eureka-server
+    environment:
+      <<: *common-env
+    ports:
+      - "8761:8761"
+    restart: unless-stopped
+
+  api-gateway:
+    build:
+      <<: *app-build
+      context: ../quizmaster-api-gateway
+    environment:
+      <<: *common-env
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ISSUER: ${JWT_ISSUER}
+      JWT_ACCESS_EXPIRATION_MS: ${JWT_ACCESS_EXPIRATION_MS}
+      JWT_REFRESH_EXPIRATION_MS: ${JWT_REFRESH_EXPIRATION_MS}
+      APP_CORS_ALLOWED_ORIGINS: ${APP_CORS_ALLOWED_ORIGINS}
+    ports:
+      - "8080:8080"
+    depends_on:
+      eureka-server:
+        condition: service_started
+    restart: unless-stopped
+
+  auth-service:
+    build:
+      <<: *app-build
+      context: ../quizmaster-auth-service
+    environment:
+      <<: [*common-env, *db-env]
+      DB_URL: jdbc:postgresql://postgres:5432/auth_db
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ISSUER: ${JWT_ISSUER}
+      JWT_ACCESS_EXPIRATION_MS: ${JWT_ACCESS_EXPIRATION_MS}
+      JWT_REFRESH_EXPIRATION_MS: ${JWT_REFRESH_EXPIRATION_MS}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      GOOGLE_SCOPES: ${GOOGLE_SCOPES}
+      MAIL_HOST: ${MAIL_HOST}
+      MAIL_PORT: ${MAIL_PORT}
+      MAIL_USERNAME: ${MAIL_USERNAME}
+      MAIL_PASSWORD: ${MAIL_PASSWORD}
+      MAIL_SMTP_AUTH: ${MAIL_SMTP_AUTH}
+      MAIL_SMTP_STARTTLS_ENABLE: ${MAIL_SMTP_STARTTLS_ENABLE}
+      FRONTEND_URL: ${FRONTEND_URL}
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      eureka-server:
+        condition: service_started
+    restart: unless-stopped
+
+  quiz-service:
+    build:
+      <<: *app-build
+      context: ../quizmaster-quiz-service
+    environment:
+      <<: [*common-env, *db-env]
+      DB_URL: jdbc:postgresql://postgres:5432/quiz_db
+    ports:
+      - "8082:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      eureka-server:
+        condition: service_started
+    restart: unless-stopped
+
+  attempt-service:
+    build:
+      <<: *app-build
+      context: ../quizmaster-attempt-service
+    environment:
+      <<: [*common-env, *db-env, *kafka-env]
+      DB_URL: jdbc:postgresql://postgres:5432/quiz_attempt_db
+    ports:
+      - "8083:8083"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      eureka-server:
+        condition: service_started
+    restart: unless-stopped
+
+  grading-service:
+    build:
+      <<: *app-build
+      context: ../quizmaster-grading-service
+    environment:
+      <<: [*common-env, *kafka-env]
+    ports:
+      - "8084:8084"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      eureka-server:
+        condition: service_started
+    restart: unless-stopped
+
+  notification-service:
+    build:
+      <<: *app-build
+      context: ../quizmaster-notification-service
+    environment:
+      <<: [*common-env, *db-env, *kafka-env]
+      DB_URL: jdbc:postgresql://postgres:5432/quiz_notification_db
+    ports:
+      - "8085:8085"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      eureka-server:
+        condition: service_started
+    restart: unless-stopped
+
+  analytics-service:
+    build:
+      <<: *app-build
+      context: ../quizmaster-analytics-service
+    environment:
+      <<: [*common-env, *db-env, *kafka-env]
+      DB_URL: jdbc:postgresql://postgres:5432/quiz_analytics_db
+    ports:
+      - "8086:8086"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      eureka-server:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  pgdata:
